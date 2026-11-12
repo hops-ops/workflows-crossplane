@@ -94,6 +94,18 @@ on:
         type: number
         default: 3600
 
+      job-timeout-minutes:
+        description: "Overall job timeout in minutes (keep below GitHub's 360 hard limit so cleanup/sweep steps get to run)"
+        required: false
+        type: number
+        default: 120
+
+      aws-sweep:
+        description: "Run a final AWS sweep deleting resources tagged e2etest=true and this run's test-run value (never persistent=true)"
+        required: false
+        type: boolean
+        default: true
+
       debug-resource-types:
         description: 'JSON array of resource types to debug and delete on test failure. These resources will be logged for debugging and deleted during cleanup to handle sibling resources not removed by cascade deletion (e.g., ["network.hops.ops.com.ai", "IdentityCenter.aws.platform.upbound.io"])'
         required: false
@@ -178,6 +190,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.job-timeout-minutes }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -425,6 +438,21 @@ jobs:
         timeout-minutes: ${{ inputs.timeout-minutes }}
         run: |
           up test run ${{ inputs.pattern }} --e2e --skip-control-plane-cleanup
+
+      - name: Record test-run tags
+        if: always() && inputs.aws
+        run: |
+          # Collect every test-run tag value on this run's managed resources so the
+          # final AWS sweep can find leaks even if Crossplane cleanup fails.
+          CLUSTER_NAME=$(kind get clusters | head -n1)
+          [ -n "$CLUSTER_NAME" ] || exit 0
+          kind export kubeconfig --name "$CLUSTER_NAME"
+          RUNS=$(kubectl get managed -A -o json 2>/dev/null | jq -r '
+            [.items[].spec.forProvider? // {} | .. | objects
+              | (.["test-run"]? // empty), (select(.key? == "test-run") | .value // empty)]
+            | map(select(type == "string" and . != "")) | unique | join(",")' || true)
+          echo "test-run values: ${RUNS:-<none>}"
+          echo "E2E_TEST_RUNS=$RUNS" >> "$GITHUB_ENV"
 
       - name: (Debug) Set debug resource types
         if: always()
@@ -726,7 +754,7 @@ jobs:
             if [ -n "$resource_type" ]; then
               echo ""
               echo "=== Deleting $resource_type resources ==="
-              kubectl delete "$resource_type" --all -n "$NS" || true
+              kubectl delete "$resource_type" --all -n "$NS" --wait=false || true
             fi
           done
 
@@ -834,4 +862,103 @@ jobs:
                 echo "No $resource_type resources found"
               fi
             fi
+          done
+
+      - name: AWS leak sweep (resources tagged with this run's test-run)
+        if: always() && inputs.aws && inputs.aws-sweep && env.E2E_TEST_RUNS != ''
+        timeout-minutes: 30
+        env:
+          AWS_REGION: ${{ inputs.aws-region }}
+        run: |
+          # Conservative last-resort sweep. Only touches resources tagged
+          # e2etest=true AND test-run=<a value recorded from this run's MRs>,
+          # and never anything tagged hops.ops.com.ai/persistent=true.
+          set -uo pipefail
+          aws sts get-caller-identity >/dev/null || { echo "No AWS credentials (expired?), cannot sweep"; exit 0; }
+          RUNS="$E2E_TEST_RUNS"
+          echo "Sweeping test-run values: $RUNS"
+
+          # $1 = JSON tag map {k:v}; returns 0 if the resource belongs to this run and is not persistent
+          owned() {
+            echo "$1" | jq -e --arg runs "$RUNS" '
+              (.["hops.ops.com.ai/persistent"] // "") != "true"
+              and (.e2etest // "") == "true"
+              and ((.["test-run"] // "") as $r | $r != "" and ($runs | split(",") | index($r)))' >/dev/null
+          }
+
+          echo "=== 1. EKS clusters ==="
+          for c in $(aws eks list-clusters --query 'clusters[]' --output text); do
+            tags=$(aws eks describe-cluster --name "$c" --query 'cluster.tags' --output json 2>/dev/null || echo '{}')
+            owned "$tags" || continue
+            echo "Deleting EKS cluster $c"
+            for ng in $(aws eks list-nodegroups --cluster-name "$c" --query 'nodegroups[]' --output text); do
+              aws eks delete-nodegroup --cluster-name "$c" --nodegroup-name "$ng" || true
+            done
+            for fp in $(aws eks list-fargate-profiles --cluster-name "$c" --query 'fargateProfileNames[]' --output text); do
+              aws eks delete-fargate-profile --cluster-name "$c" --fargate-profile-name "$fp" || true
+              aws eks wait fargate-profile-deleted --cluster-name "$c" --fargate-profile-name "$fp" || true
+            done
+            for ng in $(aws eks list-nodegroups --cluster-name "$c" --query 'nodegroups[]' --output text); do
+              aws eks wait nodegroup-deleted --cluster-name "$c" --nodegroup-name "$ng" || true
+            done
+            for a in $(aws eks list-addons --cluster-name "$c" --query 'addons[]' --output text); do
+              aws eks delete-addon --cluster-name "$c" --addon-name "$a" || true
+            done
+            aws eks delete-cluster --name "$c" || true
+            aws eks wait cluster-deleted --name "$c" || true
+          done
+
+          echo "=== 2. IAM roles / instance profiles ==="
+          for r in $(aws iam list-roles --query 'Roles[].RoleName' --output text); do
+            tags=$(aws iam list-role-tags --role-name "$r" --output json 2>/dev/null | jq 'reduce .Tags[] as $t ({}; .[$t.Key]=$t.Value)' || echo '{}')
+            owned "$tags" || continue
+            echo "Deleting IAM role $r"
+            for ip in $(aws iam list-instance-profiles-for-role --role-name "$r" --query 'InstanceProfiles[].InstanceProfileName' --output text); do
+              aws iam remove-role-from-instance-profile --instance-profile-name "$ip" --role-name "$r" || true
+              aws iam delete-instance-profile --instance-profile-name "$ip" || true
+            done
+            for p in $(aws iam list-attached-role-policies --role-name "$r" --query 'AttachedPolicies[].PolicyArn' --output text); do
+              aws iam detach-role-policy --role-name "$r" --policy-arn "$p" || true
+            done
+            for p in $(aws iam list-role-policies --role-name "$r" --query 'PolicyNames[]' --output text); do
+              aws iam delete-role-policy --role-name "$r" --policy-name "$p" || true
+            done
+            aws iam delete-role --role-name "$r" || true
+          done
+
+          echo "=== 3. IAM customer-managed policies ==="
+          for p in $(aws iam list-policies --scope Local --query 'Policies[].Arn' --output text); do
+            tags=$(aws iam list-policy-tags --policy-arn "$p" --output json 2>/dev/null | jq 'reduce .Tags[] as $t ({}; .[$t.Key]=$t.Value)' || echo '{}')
+            owned "$tags" || continue
+            echo "Deleting IAM policy $p"
+            for v in $(aws iam list-policy-versions --policy-arn "$p" --query 'Versions[?!IsDefaultVersion].VersionId' --output text); do
+              aws iam delete-policy-version --policy-arn "$p" --version-id "$v" || true
+            done
+            aws iam delete-policy --policy-arn "$p" || true
+          done
+
+          echo "=== 4. IAM OIDC providers ==="
+          for o in $(aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[].Arn' --output text); do
+            tags=$(aws iam list-open-id-connect-provider-tags --open-id-connect-provider-arn "$o" --output json 2>/dev/null | jq 'reduce .Tags[] as $t ({}; .[$t.Key]=$t.Value)' || echo '{}')
+            owned "$tags" || continue
+            echo "Deleting OIDC provider $o"
+            aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$o" || true
+          done
+
+          echo "=== 5. KMS keys (schedule deletion, 7 days) ==="
+          for k in $(aws kms list-keys --query 'Keys[].KeyId' --output text); do
+            meta=$(aws kms describe-key --key-id "$k" --query 'KeyMetadata.[KeyManager,KeyState]' --output text 2>/dev/null) || continue
+            [ "$meta" = "$(printf 'CUSTOMER\tEnabled')" ] || [ "$meta" = "$(printf 'CUSTOMER\tDisabled')" ] || continue
+            tags=$(aws kms list-resource-tags --key-id "$k" --output json 2>/dev/null | jq 'reduce .Tags[] as $t ({}; .[$t.TagKey]=$t.TagValue)' || echo '{}')
+            owned "$tags" || continue
+            echo "Scheduling deletion of KMS key $k"
+            aws kms schedule-key-deletion --key-id "$k" --pending-window-in-days 7 || true
+          done
+
+          echo "=== 6. Unattached EBS volumes ==="
+          for v in $(aws ec2 describe-volumes --filters Name=status,Values=available Name=tag:e2etest,Values=true --query 'Volumes[].VolumeId' --output text); do
+            tags=$(aws ec2 describe-volumes --volume-ids "$v" --query 'Volumes[0].Tags' --output json | jq 'reduce (.//[])[] as $t ({}; .[$t.Key]=$t.Value)')
+            owned "$tags" || continue
+            echo "Deleting EBS volume $v"
+            aws ec2 delete-volume --volume-id "$v" || true
           done
